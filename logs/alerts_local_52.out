@@ -1,0 +1,4 @@
+[21:32:50] task 52 of 84: Listeria / Norrbotten on node sa-arch-demo-pwb
+Warning message:
+glm.fit: algorithm did not converge 
+Done: 43 weeks checked, 0 alerts, 3.65 s

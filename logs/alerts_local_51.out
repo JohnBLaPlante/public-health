@@ -1,0 +1,7 @@
+[21:32:49] task 51 of 84: Listeria / Kronoberg on node sa-arch-demo-pwb
+Warning messages:
+1: glm.fit: algorithm did not converge 
+2: glm.fit: algorithm did not converge 
+3: glm.fit: algorithm did not converge 
+4: glm.fit: algorithm did not converge 
+Done: 43 weeks checked, 0 alerts, 2.37 s

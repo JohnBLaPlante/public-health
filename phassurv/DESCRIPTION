@@ -1,0 +1,27 @@
+Package: phassurv
+Title: Shared Tools for Zoonoses Surveillance (Demo)
+Version: 0.1.0
+Authors@R:
+    person("Demo", "Analyst", email = "analyst@example.org", role = c("aut", "cre"))
+Description: Internal helper functions for the zoonoses and antibiotic
+    resistance surveillance demo: data access, outbreak detection with the
+    Farrington method, genomic cluster summaries and a shared plot theme.
+    Made for a Posit demo with synthetic data.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Depends:
+    R (>= 4.1)
+Imports:
+    arrow,
+    DBI,
+    dplyr,
+    ggplot2,
+    rlang,
+    surveillance,
+    tibble
+Suggests:
+    RPostgres,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+Config/roxygen2/version: 8.1.0

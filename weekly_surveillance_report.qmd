@@ -1,0 +1,251 @@
+---
+title: "Weekly Zoonoses Surveillance Report"
+subtitle: "Campylobacter, Salmonella, EHEC and Listeria — synthetic demo data"
+params:
+  week: "2026-09-07"
+format:
+  html:
+    embed-resources: true
+    theme: cosmo
+    toc: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(arrow)
+library(DBI)
+library(surveillance)
+
+# Report week: always the Monday of the week given in params$week.
+report_week <- as.Date(params$week)
+report_week <- report_week - (as.POSIXlt(report_week)$wday + 6) %% 7
+week_end    <- report_week + 6
+prev_week   <- report_week - 7
+
+data_dir <- "data"
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+```{r}
+#| label: connect
+# Case line list lives in PostgreSQL. Connection values come from
+# environment variables (for example in .Renviron or Connect "Vars").
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = Sys.getenv("PG_HOST"),
+  port     = as.integer(Sys.getenv("PG_PORT", "5432")),
+  dbname   = Sys.getenv("PG_DB"),
+  user     = Sys.getenv("PG_USER"),
+  password = Sys.getenv("PG_PASSWORD")
+)
+```
+
+```{r}
+#| label: load-data
+# dplyr code below is translated to SQL and runs in the database.
+cases <- tbl(con, "cases") |>
+  filter(sample_date <= !!week_end) |>
+  select(case_id, pathogen, sample_date, county_name,
+         age_group, travel_associated, hospitalised) |>
+  collect() |>
+  mutate(sample_date = as.Date(sample_date))
+
+dbDisconnect(con)
+
+# Lab and genomic data: Parquet files (later: the S3 data lake).
+weekly   <- read_parquet(file.path(data_dir, "weekly_counts.parquet")) |>
+  mutate(week_start = as.Date(week_start)) |>
+  filter(week_start <= report_week)
+isolates <- read_parquet(file.path(data_dir, "isolates.parquet"))
+ast      <- read_parquet(file.path(data_dir, "ast_results.parquet"))
+```
+
+**Report week:** `r format(report_week, "%G-W%V")` (`r format(report_week, "%d %b %Y")` – `r format(week_end, "%d %b %Y")`)
+
+## Cases this week
+
+```{r}
+#| label: headline
+this_wk <- cases |> filter(sample_date >= report_week, sample_date <= week_end)
+last_wk <- cases |> filter(sample_date >= prev_week, sample_date < report_week)
+
+headline <- tibble(pathogen = sort(unique(cases$pathogen))) |>
+  left_join(count(this_wk, pathogen, name = "this_week"), by = "pathogen") |>
+  left_join(count(last_wk, pathogen, name = "last_week"), by = "pathogen") |>
+  left_join(this_wk |> filter(hospitalised) |> count(pathogen, name = "hospitalised"),
+            by = "pathogen") |>
+  mutate(across(c(this_week, last_week, hospitalised), \(x) coalesce(x, 0L)),
+         change = this_week - last_week,
+         change = if_else(change > 0, paste0("+", change), as.character(change)))
+
+knitr::kable(
+  headline |> select(pathogen, this_week, last_week, change, hospitalised),
+  col.names = c("Pathogen", "This week", "Last week", "Change", "Hospitalised"),
+  align = "lrrrr"
+)
+```
+
+## Weekly trend (last two years)
+
+```{r}
+#| label: trend
+#| fig-height: 5
+trend <- weekly |>
+  filter(week_start > report_week - 7 * 104) |>
+  group_by(week_start, pathogen) |>
+  summarise(cases = sum(cases), .groups = "drop")
+
+ggplot(trend, aes(week_start, cases)) +
+  annotate("rect", xmin = report_week - 7 * 11, xmax = week_end,
+           ymin = -Inf, ymax = Inf, fill = "#F4D35E", alpha = 0.3) +
+  geom_line(colour = "#1F5A96") +
+  facet_wrap(~pathogen, scales = "free_y", ncol = 2) +
+  labs(x = NULL, y = "Cases per week",
+       caption = "Shaded: last 12 weeks")
+```
+
+## Outbreak alerts: Salmonella by county
+
+Method: `surveillance::farringtonFlexible()`, checked for the last 8 weeks, compared with the same period in earlier years.
+
+```{r}
+#| label: farrington
+sal <- weekly |>
+  filter(pathogen == "Salmonella") |>
+  select(week_start, county_name, cases) |>
+  pivot_wider(names_from = county_name, values_from = cases, values_fill = 0) |>
+  arrange(week_start)
+
+obs <- as.matrix(sal[, -1])
+n   <- nrow(obs)
+w   <- 3
+b   <- min(3, floor((n - 8 - w) / 52))
+
+sal_sts <- sts(observed = obs, epoch = as.numeric(sal$week_start),
+               epochAsDate = TRUE, frequency = 52)
+
+res <- farringtonFlexible(sal_sts, control = list(
+  range = (n - 7):n, b = b, w = w, alpha = 0.01,
+  noPeriods = 10, populationOffset = FALSE
+))
+
+alerts <- tibble(
+  week_start = rep(as.Date(epoch(res)), times = ncol(res)),
+  county     = rep(colnames(observed(res)), each = nrow(res)),
+  observed   = as.vector(observed(res)),
+  threshold  = round(as.vector(upperbound(res)), 1),
+  alarm      = as.vector(alarms(res))
+)
+
+alarm_tbl <- alerts |>
+  filter(alarm) |>
+  arrange(desc(week_start), desc(observed)) |>
+  mutate(week = format(week_start, "%G-W%V")) |>
+  select(week, county, observed, threshold)
+```
+
+```{r}
+#| label: alert-table
+if (nrow(alarm_tbl) == 0) {
+  cat("No alerts in the last 8 weeks.")
+} else {
+  knitr::kable(alarm_tbl, col.names = c("Week", "County", "Cases", "Alert threshold"),
+               align = "llrr")
+}
+```
+
+```{r}
+#| label: alert-plot
+#| fig-height: 4
+alert_counties <- unique(alarm_tbl$county)
+if (length(alert_counties) > 0) {
+  alerts |>
+    filter(county %in% alert_counties) |>
+    ggplot(aes(week_start)) +
+    geom_col(aes(y = observed, fill = alarm)) +
+    geom_step(aes(y = threshold), direction = "mid", colour = "grey30") +
+    scale_fill_manual(values = c(`FALSE` = "#9BB7D4", `TRUE` = "#C0392B"),
+                      labels = c("Normal", "Alert"), name = NULL) +
+    facet_wrap(~county) +
+    labs(x = NULL, y = "Cases per week", caption = "Line: alert threshold")
+}
+```
+
+## Genomic clusters (last 6 weeks)
+
+Clusters with 5 or more isolates of the same pathogen, sampled in the last 6 weeks.
+
+```{r}
+#| label: clusters
+recent_iso <- isolates |>
+  filter(!is.na(cgmlst_cluster)) |>
+  inner_join(cases |> select(case_id, sample_date, county_name), by = "case_id") |>
+  filter(sample_date > week_end - 42)
+
+clusters <- recent_iso |>
+  group_by(cgmlst_cluster, pathogen) |>
+  filter(n() >= 5) |>
+  summarise(
+    isolates    = n(),
+    subtype     = paste(unique(subtype), collapse = ", "),
+    counties    = paste(sort(unique(county_name)), collapse = ", "),
+    first       = min(sample_date),
+    last        = max(sample_date),
+    .groups = "drop"
+  )
+
+if (nrow(clusters) == 0) {
+  cat("No clusters with 5 or more isolates in the last 6 weeks.")
+} else {
+  profile <- ast |>
+    inner_join(recent_iso |> select(isolate_id, cgmlst_cluster), by = "isolate_id") |>
+    semi_join(clusters, by = "cgmlst_cluster") |>
+    group_by(cgmlst_cluster, antibiotic) |>
+    summarise(pct_r = mean(result == "R"), .groups = "drop") |>
+    filter(pct_r >= 0.5) |>
+    group_by(cgmlst_cluster) |>
+    summarise(resistant_to = paste(antibiotic, collapse = ", "), .groups = "drop")
+
+  clusters |>
+    left_join(profile, by = "cgmlst_cluster") |>
+    mutate(resistant_to = coalesce(resistant_to, "none")) |>
+    select(cgmlst_cluster, pathogen, subtype, isolates, counties, first, last, resistant_to) |>
+    knitr::kable(col.names = c("Cluster", "Pathogen", "Subtype", "Isolates",
+                               "Counties", "First sample", "Last sample", "Resistant to"))
+}
+```
+
+## Ciprofloxacin resistance in Campylobacter
+
+```{r}
+#| label: cipro
+#| fig-height: 3.5
+cipro <- ast |>
+  filter(antibiotic == "ciprofloxacin") |>
+  inner_join(isolates |> filter(pathogen == "Campylobacter") |> select(isolate_id, case_id),
+             by = "isolate_id") |>
+  inner_join(cases |> select(case_id, sample_date, travel_associated), by = "case_id") |>
+  mutate(year = format(sample_date, "%Y"),
+         origin = if_else(travel_associated, "Travel-associated", "Domestic")) |>
+  group_by(year, origin) |>
+  summarise(pct_r = 100 * mean(result == "R"), tested = n(), .groups = "drop")
+
+ggplot(cipro, aes(year, pct_r, colour = origin, group = origin)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(Domestic = "#1F5A96", `Travel-associated` = "#E07A1F")) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = NULL, y = "% resistant", colour = NULL)
+```
+
+---
+
+*Synthetic data made for a Posit demo. It contains no real people, cases or lab results.*
